@@ -10,19 +10,44 @@ import "./style.css";
 // ----------------------
 // GAME CONSTANTS
 // ----------------------
-const CLASSROOM_LATLNG = leaflet.latLng(
+const TILE_DEGREES = 0.0001; // size of grid cell (about house size)
+const INTERACT_RANGE = 3; // cells away player can interact
+const VIEWPORT_RADIUS = 50; // cells to keep visible around viewport
+const TARGET_VALUE = 64; // higher win condition for D3.b
+const CACHE_SPAWN_PROBABILITY = 0.1;
+
+// Starting location (classroom)
+const STARTING_LATLNG = leaflet.latLng(
   36.997936938057016,
   -122.05703507501151,
 );
-const TILE_DEGREES = 0.0001; // size of grid cell (about house size)
-const INTERACT_RANGE = 10; // cells away player can interact
-const WORLD_RADIUS = 50; // cells to render in each direction
-const TARGET_VALUE = 16; // win condition value
-const CACHE_SPAWN_PROBABILITY = 0.1;
+
+// ----------------------
+// CELL DATA TYPE
+// ----------------------
+interface Cell {
+  i: number;
+  j: number;
+}
+
+interface CacheState {
+  value: number;
+}
 
 // ----------------------
 // SETUP UI
 // ----------------------
+const controlPanel = document.createElement("div");
+controlPanel.id = "controlPanel";
+controlPanel.innerHTML = `
+  <button id="north">⬆</button>
+  <button id="south">⬇</button>
+  <button id="west">⬅</button>
+  <button id="east">⮕a</button>
+  <button id="reset">🔄 Reset Position</button>
+`;
+document.body.append(controlPanel);
+
 const statusPanel = document.createElement("div");
 statusPanel.id = "statusPanel";
 document.body.append(statusPanel);
@@ -35,12 +60,12 @@ document.body.append(mapDiv);
 // INIT MAP
 // ----------------------
 const map = leaflet.map(mapDiv, {
-  center: CLASSROOM_LATLNG,
+  center: STARTING_LATLNG,
   zoom: 19,
   minZoom: 19,
   maxZoom: 19,
   zoomControl: false,
-  scrollWheelZoom: false,
+  scrollWheelZoom: true,
 });
 
 leaflet
@@ -50,91 +75,106 @@ leaflet
   })
   .addTo(map);
 
-const playerMarker = leaflet.marker(CLASSROOM_LATLNG).addTo(map);
+// Player marker
+let playerPosition = STARTING_LATLNG;
+const playerMarker = leaflet.marker(playerPosition).addTo(map);
 playerMarker.bindTooltip("That's you!");
 
 // ----------------------
 // GAME STATE
 // ----------------------
-interface CacheData {
-  i: number;
-  j: number;
-  value: number;
-}
-
-// Store cache states
-const caches = new Map<string, CacheData>();
+// Active caches currently visible on map
+const activeCaches = new Map<string, {
+  rect: leaflet.Rectangle;
+  marker: leaflet.Marker;
+  cell: Cell;
+}>();
 
 // Player inventory
 let playerInventory: number | null = null;
 
 // Player position in grid coordinates
-const playerGridPos = { i: 0, j: 0 };
+let playerCell: Cell;
 
 // ----------------------
-// HELPER FUNCTIONS
+// CELL COORDINATE FUNCTIONS
 // ----------------------
-function cellKey(i: number, j: number): string {
-  return `${i},${j}`;
+function cellKey(cell: Cell): string {
+  return `${cell.i},${cell.j}`;
 }
 
-function cellToLatLng(i: number, j: number): leaflet.LatLng {
-  const lat = CLASSROOM_LATLNG.lat + i * TILE_DEGREES;
-  const lng = CLASSROOM_LATLNG.lng + j * TILE_DEGREES;
+function latLngToCell(latLng: leaflet.LatLng): Cell {
+  // Convert from Null Island coordinate system
+  const i = Math.floor(latLng.lat / TILE_DEGREES);
+  const j = Math.floor(latLng.lng / TILE_DEGREES);
+  return { i, j };
+}
+
+function cellToLatLng(cell: Cell): leaflet.LatLng {
+  // Convert to lat/lng using Null Island as origin
+  const lat = cell.i * TILE_DEGREES;
+  const lng = cell.j * TILE_DEGREES;
   return leaflet.latLng(lat, lng);
 }
 
-function canInteract(i: number, j: number): boolean {
-  const di = Math.abs(i - playerGridPos.i);
-  const dj = Math.abs(j - playerGridPos.j);
+function getCellBounds(cell: Cell): leaflet.LatLngBounds {
+  const nw = cellToLatLng(cell);
+  const se = cellToLatLng({ i: cell.i + 1, j: cell.j + 1 });
+  return leaflet.latLngBounds(nw, se);
+}
+
+function canInteract(cell: Cell): boolean {
+  const di = Math.abs(cell.i - playerCell.i);
+  const dj = Math.abs(cell.j - playerCell.j);
   return di <= INTERACT_RANGE && dj <= INTERACT_RANGE;
 }
 
-function determineCacheValue(i: number, j: number): number {
+function determineCacheValue(cell: Cell): number {
   // Deterministic spawning of token values (2, 4, or 8)
-  const valueSeed = luck(`${i},${j},value`);
+  const valueSeed = luck(`${cell.i},${cell.j},value`);
   const powerOf2 = 1 + Math.floor(valueSeed * 3); // 1, 2, or 3
   return Math.pow(2, powerOf2); // 2, 4, or 8
 }
 
-function updateStatusPanel() {
-  if (playerInventory === null) {
-    statusPanel.innerHTML = "<strong>Inventory:</strong> Empty";
-  } else {
-    statusPanel.innerHTML =
-      `<strong>Inventory:</strong> Token [${playerInventory}]`;
-    if (playerInventory >= TARGET_VALUE) {
-      statusPanel.innerHTML +=
-        "<br>🎉 <strong>Victory! You crafted a token worth " +
-        TARGET_VALUE + " or more!</strong>";
-    }
-  }
+function shouldSpawnCache(cell: Cell): boolean {
+  const spawnChance = luck(`${cell.i},${cell.j},spawn`);
+  return spawnChance < CACHE_SPAWN_PROBABILITY;
 }
 
 // ----------------------
-// CACHE SPAWNING
+// STATUS UPDATE
 // ----------------------
-function spawnCache(i: number, j: number) {
-  const key = cellKey(i, j);
+function updateStatusPanel() {
+  const cellInfo = `Position: (${playerCell.i}, ${playerCell.j})`;
+  let inventoryInfo: string;
 
-  // Check if cache should spawn here (deterministic)
-  const spawnChance = luck(`${i},${j},spawn`);
-  if (spawnChance >= CACHE_SPAWN_PROBABILITY) {
-    return; // No cache here
+  if (playerInventory === null) {
+    inventoryInfo = "Inventory: Empty";
+  } else {
+    inventoryInfo = `Inventory: Token [${playerInventory}]`;
+    if (playerInventory >= TARGET_VALUE) {
+      inventoryInfo += "<br>🎉 <strong>Victory! You crafted a token worth " +
+        TARGET_VALUE + " or more!</strong>";
+    }
   }
 
-  // Determine initial value
-  const initialValue = determineCacheValue(i, j);
+  statusPanel.innerHTML = `<strong>${cellInfo}</strong><br>${inventoryInfo}`;
+}
 
-  // Store cache data
-  caches.set(key, { i, j, value: initialValue });
+// ----------------------
+// CACHE MANAGEMENT
+// ----------------------
+function createCacheVisual(cell: Cell) {
+  const key = cellKey(cell);
 
-  // Create visual representation
-  const origin = cellToLatLng(i, j);
-  const bounds = leaflet.latLngBounds([
-    [origin.lat, origin.lng],
-    [origin.lat + TILE_DEGREES, origin.lng + TILE_DEGREES],
-  ]);
+  // Don't create if already exists
+  if (activeCaches.has(key)) return;
+
+  // Check if cache should spawn
+  if (!shouldSpawnCache(cell)) return;
+
+  const bounds = getCellBounds(cell);
+  const initialValue = determineCacheValue(cell);
 
   // Create rectangle for the cell
   const rect = leaflet.rectangle(bounds, {
@@ -157,15 +197,20 @@ function spawnCache(i: number, j: number) {
     iconSize: [40, 40],
   });
 
-  const labelMarker = leaflet.marker(bounds.getCenter(), {
+  const marker = leaflet.marker(bounds.getCenter(), {
     icon: labelIcon,
   }).addTo(map);
 
-  // Update visual based on cache state
+  // Store reference
+  activeCaches.set(key, { rect, marker, cell });
+
+  // Cache state (memoryless - resets each time)
+  let cacheValue = initialValue;
+
+  // Update visual
   function updateVisual() {
-    const cache = caches.get(key);
-    if (cache && cache.value > 0) {
-      labelDiv.innerHTML = `<strong>${cache.value}</strong>`;
+    if (cacheValue > 0) {
+      labelDiv.innerHTML = `<strong>${cacheValue}</strong>`;
       labelDiv.style.display = "block";
       rect.setStyle({ fillOpacity: 0.2 });
     } else {
@@ -177,22 +222,16 @@ function spawnCache(i: number, j: number) {
 
   // Interaction handler
   function handleInteraction() {
-    const cache = caches.get(key);
-    if (!cache) return;
-
     // Check interaction range
-    if (!canInteract(i, j)) {
-      alert(
-        "Too far away! You can only interact with cells within " +
-          INTERACT_RANGE + " cells of your location.",
-      );
+    if (!canInteract(cell)) {
+      alert("Too far away! Move closer to interact.");
       return;
     }
 
-    // Case 1: Pick up token (inventory empty, cache has token)
-    if (playerInventory === null && cache.value > 0) {
-      playerInventory = cache.value;
-      cache.value = 0;
+    // Case 1: Pick up token
+    if (playerInventory === null && cacheValue > 0) {
+      playerInventory = cacheValue;
+      cacheValue = 0;
       updateVisual();
       updateStatusPanel();
       return;
@@ -200,10 +239,10 @@ function spawnCache(i: number, j: number) {
 
     // Case 2: Craft - combine equal tokens
     if (
-      playerInventory !== null && cache.value > 0 &&
-      playerInventory === cache.value
+      playerInventory !== null && cacheValue > 0 &&
+      playerInventory === cacheValue
     ) {
-      cache.value = playerInventory * 2;
+      cacheValue = playerInventory * 2;
       playerInventory = null;
       updateVisual();
       updateStatusPanel();
@@ -211,27 +250,24 @@ function spawnCache(i: number, j: number) {
     }
 
     // Case 3: Place token into empty cache
-    if (playerInventory !== null && cache.value === 0) {
-      cache.value = playerInventory;
+    if (playerInventory !== null && cacheValue === 0) {
+      cacheValue = playerInventory;
       playerInventory = null;
       updateVisual();
       updateStatusPanel();
       return;
     }
 
-    // No valid action
-    alert(
-      "Nothing happens. Try picking up a token or combining matching tokens!",
-    );
+    alert("Nothing happens. Try picking up or combining matching tokens!");
   }
 
   // Click handlers
   rect.on("click", handleInteraction);
-  labelMarker.on("click", handleInteraction);
+  marker.on("click", handleInteraction);
 
   // Hover effects
   rect.on("mouseover", () => {
-    if (canInteract(i, j)) {
+    if (canInteract(cell)) {
       rect.setStyle({ color: "#00ff00", weight: 2 });
     } else {
       rect.setStyle({ color: "#ff0000", weight: 2 });
@@ -245,20 +281,112 @@ function spawnCache(i: number, j: number) {
   updateVisual();
 }
 
-// ----------------------
-// INITIALIZE WORLD
-// ----------------------
-function initializeWorld() {
-  // Spawn caches in a large area around the player
-  for (let i = -WORLD_RADIUS; i <= WORLD_RADIUS; i++) {
-    for (let j = -WORLD_RADIUS; j <= WORLD_RADIUS; j++) {
-      spawnCache(i, j);
+function removeCacheVisual(cell: Cell) {
+  const key = cellKey(cell);
+  const cache = activeCaches.get(key);
+
+  if (cache) {
+    cache.rect.remove();
+    cache.marker.remove();
+    activeCaches.delete(key);
+  }
+}
+
+function getVisibleCells(): Cell[] {
+  const bounds = map.getBounds();
+  const nwCell = latLngToCell(bounds.getNorthWest());
+  const seCell = latLngToCell(bounds.getSouthEast());
+
+  const cells: Cell[] = [];
+
+  // Add buffer around visible area
+  for (
+    let i = nwCell.i - VIEWPORT_RADIUS;
+    i <= seCell.i + VIEWPORT_RADIUS;
+    i++
+  ) {
+    for (
+      let j = nwCell.j - VIEWPORT_RADIUS;
+      j <= seCell.j + VIEWPORT_RADIUS;
+      j++
+    ) {
+      cells.push({ i, j });
     }
+  }
+
+  return cells;
+}
+
+function regenerateCaches() {
+  const visibleCells = getVisibleCells();
+  const visibleKeys = new Set(visibleCells.map(cellKey));
+
+  // Remove caches no longer visible
+  for (const [key, cache] of activeCaches) {
+    if (!visibleKeys.has(key)) {
+      removeCacheVisual(cache.cell);
+    }
+  }
+
+  // Add new visible caches
+  for (const cell of visibleCells) {
+    createCacheVisual(cell);
   }
 }
 
 // ----------------------
-// START GAME
+// PLAYER MOVEMENT
 // ----------------------
-initializeWorld();
+function movePlayer(di: number, dj: number) {
+  // Update player cell position
+  playerCell = { i: playerCell.i + di, j: playerCell.j + dj };
+
+  // Update player marker position
+  playerPosition = cellToLatLng(playerCell);
+  playerMarker.setLatLng(playerPosition);
+
+  // Center map on player
+  map.panTo(playerPosition);
+
+  updateStatusPanel();
+}
+
+// ----------------------
+// EVENT HANDLERS
+// ----------------------
+// Movement buttons
+document.getElementById("north")!.addEventListener("click", () => {
+  movePlayer(1, 0);
+});
+
+document.getElementById("south")!.addEventListener("click", () => {
+  movePlayer(-1, 0);
+});
+
+document.getElementById("west")!.addEventListener("click", () => {
+  movePlayer(0, -1);
+});
+
+document.getElementById("east")!.addEventListener("click", () => {
+  movePlayer(0, 1);
+});
+
+document.getElementById("reset")!.addEventListener("click", () => {
+  playerPosition = STARTING_LATLNG;
+  playerCell = latLngToCell(playerPosition);
+  playerMarker.setLatLng(playerPosition);
+  map.setView(playerPosition);
+  updateStatusPanel();
+});
+
+// Map movement (scrolling)
+map.on("moveend", () => {
+  regenerateCaches();
+});
+
+// ----------------------
+// INITIALIZATION
+// ----------------------
+playerCell = latLngToCell(STARTING_LATLNG);
+regenerateCaches();
 updateStatusPanel();
