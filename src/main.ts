@@ -43,7 +43,7 @@ controlPanel.innerHTML = `
   <button id="north">⬆</button>
   <button id="south">⬇</button>
   <button id="west">⬅</button>
-  <button id="east">⮕a</button>
+  <button id="east">➡</button>
   <button id="reset">🔄 Reset Position</button>
 `;
 document.body.append(controlPanel);
@@ -83,7 +83,10 @@ playerMarker.bindTooltip("That's you!");
 // ----------------------
 // GAME STATE
 // ----------------------
-// Active caches currently visible on map
+// Persistent cache states (Memento pattern) - only stores modified caches
+const cacheStates = new Map<string, CacheState>();
+
+// Active caches currently visible on map (Flyweight pattern)
 const activeCaches = new Map<string, {
   rect: leaflet.Rectangle;
   marker: leaflet.Marker;
@@ -136,6 +139,25 @@ function determineCacheValue(cell: Cell): number {
   return Math.pow(2, powerOf2); // 2, 4, or 8
 }
 
+function getCacheValue(cell: Cell): number {
+  // Check if we have a stored state (Memento pattern)
+  const key = cellKey(cell);
+  const stored = cacheStates.get(key);
+
+  if (stored !== undefined) {
+    return stored.value;
+  }
+
+  // Otherwise, return the deterministic initial value
+  return determineCacheValue(cell);
+}
+
+function setCacheValue(cell: Cell, value: number) {
+  // Store the modified state (Memento pattern)
+  const key = cellKey(cell);
+  cacheStates.set(key, { value });
+}
+
 function shouldSpawnCache(cell: Cell): boolean {
   const spawnChance = luck(`${cell.i},${cell.j},spawn`);
   return spawnChance < CACHE_SPAWN_PROBABILITY;
@@ -174,7 +196,9 @@ function createCacheVisual(cell: Cell) {
   if (!shouldSpawnCache(cell)) return;
 
   const bounds = getCellBounds(cell);
-  const initialValue = determineCacheValue(cell);
+
+  // Get current value (either stored or initial) - Memento pattern
+  let cacheValue = getCacheValue(cell);
 
   // Create rectangle for the cell
   const rect = leaflet.rectangle(bounds, {
@@ -186,7 +210,7 @@ function createCacheVisual(cell: Cell) {
   // Create label showing token value
   const labelDiv = document.createElement("div");
   labelDiv.className = "cache-label";
-  labelDiv.innerHTML = `<strong>${initialValue}</strong>`;
+  labelDiv.innerHTML = `<strong>${cacheValue}</strong>`;
   labelDiv.style.fontSize = "14px";
   labelDiv.style.fontWeight = "bold";
   labelDiv.style.textAlign = "center";
@@ -201,11 +225,8 @@ function createCacheVisual(cell: Cell) {
     icon: labelIcon,
   }).addTo(map);
 
-  // Store reference
+  // Store reference (Flyweight pattern - only visible caches)
   activeCaches.set(key, { rect, marker, cell });
-
-  // Cache state (memoryless - resets each time)
-  let cacheValue = initialValue;
 
   // Update visual
   function updateVisual() {
@@ -232,6 +253,7 @@ function createCacheVisual(cell: Cell) {
     if (playerInventory === null && cacheValue > 0) {
       playerInventory = cacheValue;
       cacheValue = 0;
+      setCacheValue(cell, cacheValue); // Persist state
       updateVisual();
       updateStatusPanel();
       return;
@@ -244,6 +266,7 @@ function createCacheVisual(cell: Cell) {
     ) {
       cacheValue = playerInventory * 2;
       playerInventory = null;
+      setCacheValue(cell, cacheValue); // Persist state
       updateVisual();
       updateStatusPanel();
       return;
@@ -253,6 +276,7 @@ function createCacheVisual(cell: Cell) {
     if (playerInventory !== null && cacheValue === 0) {
       cacheValue = playerInventory;
       playerInventory = null;
+      setCacheValue(cell, cacheValue); // Persist state
       updateVisual();
       updateStatusPanel();
       return;
@@ -321,14 +345,14 @@ function regenerateCaches() {
   const visibleCells = getVisibleCells();
   const visibleKeys = new Set(visibleCells.map(cellKey));
 
-  // Remove caches no longer visible
+  // Remove caches no longer visible (Flyweight - free memory)
   for (const [key, cache] of activeCaches) {
     if (!visibleKeys.has(key)) {
       removeCacheVisual(cache.cell);
     }
   }
 
-  // Add new visible caches
+  // Add new visible caches (restore from Memento if modified)
   for (const cell of visibleCells) {
     createCacheVisual(cell);
   }
