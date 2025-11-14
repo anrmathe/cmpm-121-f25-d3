@@ -78,12 +78,6 @@ function cellKey(i: number, j: number): string {
   return `${i},${j}`;
 }
 
-function latLngToCell(lat: number, lng: number): { i: number; j: number } {
-  const i = Math.floor((lat - CLASSROOM_LATLNG.lat) / TILE_DEGREES);
-  const j = Math.floor((lng - CLASSROOM_LATLNG.lng) / TILE_DEGREES);
-  return { i, j };
-}
-
 function cellToLatLng(i: number, j: number): leaflet.LatLng {
   const lat = CLASSROOM_LATLNG.lat + i * TILE_DEGREES;
   const lng = CLASSROOM_LATLNG.lng + j * TILE_DEGREES;
