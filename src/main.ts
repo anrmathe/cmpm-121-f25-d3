@@ -22,6 +22,10 @@ const STARTING_LATLNG = leaflet.latLng(
   -122.05703507501151,
 );
 
+// Movement mode from query string
+const urlParams = new URLSearchParams(globalThis.location.search);
+const movementMode = urlParams.get("movement") || "buttons";
+
 // ----------------------
 // CELL DATA TYPE
 // ----------------------
@@ -32,6 +36,90 @@ interface Cell {
 
 interface CacheState {
   value: number;
+}
+
+// ----------------------
+// MOVEMENT FACADE (Design Pattern)
+// ----------------------
+interface MovementController {
+  initialize(): void;
+  cleanup(): void;
+}
+
+class ButtonMovementController implements MovementController {
+  initialize(): void {
+    const controlPanel = document.getElementById("controlPanel")!;
+    controlPanel.style.display = "block";
+
+    document.getElementById("north")!.addEventListener("click", () => {
+      movePlayer(1, 0);
+    });
+    document.getElementById("south")!.addEventListener("click", () => {
+      movePlayer(-1, 0);
+    });
+    document.getElementById("west")!.addEventListener("click", () => {
+      movePlayer(0, -1);
+    });
+    document.getElementById("east")!.addEventListener("click", () => {
+      movePlayer(0, 1);
+    });
+  }
+
+  cleanup(): void {
+    const controlPanel = document.getElementById("controlPanel")!;
+    controlPanel.style.display = "none";
+  }
+}
+
+class GeolocationMovementController implements MovementController {
+  private watchId: number | null = null;
+
+  initialize(): void {
+    const controlPanel = document.getElementById("controlPanel")!;
+    controlPanel.style.display = "none";
+
+    if (!navigator.geolocation) {
+      alert("Geolocation is not supported by your browser");
+      return;
+    }
+
+    this.watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const newLatLng = leaflet.latLng(
+          position.coords.latitude,
+          position.coords.longitude,
+        );
+
+        const newCell = latLngToCell(newLatLng);
+
+        // Only update if cell changed
+        if (newCell.i !== playerCell.i || newCell.j !== playerCell.j) {
+          playerCell = newCell;
+          playerPosition = newLatLng;
+          playerMarker.setLatLng(playerPosition);
+          map.panTo(playerPosition);
+          updateStatusPanel();
+          saveGameState();
+        }
+      },
+      (error) => {
+        console.error("Geolocation error:", error);
+        alert("Unable to get your location: " + error.message);
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 10000,
+        timeout: 5000,
+      },
+    );
+  }
+
+  cleanup(): void {
+    if (this.watchId !== null) {
+      navigator.geolocation.clearWatch(this.watchId);
+      this.watchId = null;
+    }
+  }
 }
 
 // ----------------------
@@ -51,6 +139,24 @@ document.body.append(controlPanel);
 const statusPanel = document.createElement("div");
 statusPanel.id = "statusPanel";
 document.body.append(statusPanel);
+
+// Movement mode switcher and new game button
+const modePanel = document.createElement("div");
+modePanel.id = "modePanel";
+modePanel.style.cssText =
+  "position: absolute; top: 10px; right: 10px; z-index: 1000; background: white; padding: 10px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);";
+modePanel.innerHTML = `
+  <div style="margin-bottom: 5px;">
+    <strong>Mode:</strong> ${
+  movementMode === "geolocation" ? "📍 GPS" : "🎮 Buttons"
+}
+  </div>
+  <button id="switchMode" style="margin-bottom: 5px; width: 100%;">
+    Switch to ${movementMode === "geolocation" ? "Buttons" : "GPS"}
+  </button>
+  <button id="newGame" style="width: 100%;">New Game</button>
+`;
+document.body.append(modePanel);
 
 const mapDiv = document.createElement("div");
 mapDiv.id = "map";
@@ -98,6 +204,77 @@ let playerInventory: number | null = null;
 
 // Player position in grid coordinates
 let playerCell: Cell;
+
+// Movement controller
+let movementController: MovementController;
+
+// ----------------------
+// LOCALSTORAGE PERSISTENCE
+// ----------------------
+interface GameState {
+  playerCell: Cell;
+  playerInventory: number | null;
+  cacheStates: [string, CacheState][];
+}
+
+function saveGameState() {
+  const state: GameState = {
+    playerCell,
+    playerInventory,
+    cacheStates: Array.from(cacheStates.entries()),
+  };
+  localStorage.setItem("geocacheGameState", JSON.stringify(state));
+}
+
+function loadGameState(): boolean {
+  const saved = localStorage.getItem("geocacheGameState");
+  if (!saved) return false;
+
+  try {
+    const state: GameState = JSON.parse(saved);
+    playerCell = state.playerCell;
+    playerInventory = state.playerInventory;
+    cacheStates.clear();
+    state.cacheStates.forEach(([key, value]) => {
+      cacheStates.set(key, value);
+    });
+
+    // Update player position
+    playerPosition = cellToLatLng(playerCell);
+    playerMarker.setLatLng(playerPosition);
+    map.setView(playerPosition);
+
+    return true;
+  } catch (e) {
+    console.error("Failed to load game state:", e);
+    return false;
+  }
+}
+
+function resetGame() {
+  if (!confirm("Start a new game? This will reset all progress.")) {
+    return;
+  }
+
+  localStorage.removeItem("geocacheGameState");
+  cacheStates.clear();
+  playerInventory = null;
+  playerCell = latLngToCell(STARTING_LATLNG);
+  playerPosition = STARTING_LATLNG;
+  playerMarker.setLatLng(playerPosition);
+  map.setView(playerPosition);
+
+  // Clear and regenerate caches
+  activeCaches.forEach((cache) => {
+    cache.rect.remove();
+    cache.marker.remove();
+  });
+  activeCaches.clear();
+
+  regenerateCaches();
+  updateStatusPanel();
+  saveGameState();
+}
 
 // ----------------------
 // CELL COORDINATE FUNCTIONS
@@ -256,6 +433,7 @@ function createCacheVisual(cell: Cell) {
       setCacheValue(cell, cacheValue); // Persist state
       updateVisual();
       updateStatusPanel();
+      saveGameState();
       return;
     }
 
@@ -269,6 +447,7 @@ function createCacheVisual(cell: Cell) {
       setCacheValue(cell, cacheValue); // Persist state
       updateVisual();
       updateStatusPanel();
+      saveGameState();
       return;
     }
 
@@ -279,6 +458,7 @@ function createCacheVisual(cell: Cell) {
       setCacheValue(cell, cacheValue); // Persist state
       updateVisual();
       updateStatusPanel();
+      saveGameState();
       return;
     }
 
@@ -373,34 +553,26 @@ function movePlayer(di: number, dj: number) {
   map.panTo(playerPosition);
 
   updateStatusPanel();
+  saveGameState();
 }
 
 // ----------------------
 // EVENT HANDLERS
 // ----------------------
-// Movement buttons
-document.getElementById("north")!.addEventListener("click", () => {
-  movePlayer(1, 0);
-});
-
-document.getElementById("south")!.addEventListener("click", () => {
-  movePlayer(-1, 0);
-});
-
-document.getElementById("west")!.addEventListener("click", () => {
-  movePlayer(0, -1);
-});
-
-document.getElementById("east")!.addEventListener("click", () => {
-  movePlayer(0, 1);
-});
-
 document.getElementById("reset")!.addEventListener("click", () => {
   playerPosition = STARTING_LATLNG;
   playerCell = latLngToCell(playerPosition);
   playerMarker.setLatLng(playerPosition);
   map.setView(playerPosition);
   updateStatusPanel();
+  saveGameState();
+});
+
+document.getElementById("newGame")!.addEventListener("click", resetGame);
+
+document.getElementById("switchMode")!.addEventListener("click", () => {
+  const newMode = movementMode === "geolocation" ? "buttons" : "geolocation";
+  globalThis.location.href = `?movement=${newMode}`;
 });
 
 // Map movement (scrolling)
@@ -411,6 +583,22 @@ map.on("moveend", () => {
 // ----------------------
 // INITIALIZATION
 // ----------------------
-playerCell = latLngToCell(STARTING_LATLNG);
+// Try to load saved game state
+const stateLoaded = loadGameState();
+
+if (!stateLoaded) {
+  // No saved state, start fresh
+  playerCell = latLngToCell(STARTING_LATLNG);
+  playerPosition = STARTING_LATLNG;
+}
+
+// Initialize movement controller based on mode (Facade pattern)
+if (movementMode === "geolocation") {
+  movementController = new GeolocationMovementController();
+} else {
+  movementController = new ButtonMovementController();
+}
+
+movementController.initialize();
 regenerateCaches();
 updateStatusPanel();
